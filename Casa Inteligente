@@ -1,0 +1,665 @@
+/*
+  AUTOMACAO DE 3 JANELAS - ESP32 DevKit V1 (30 pinos)
+  --------------------------------------------------
+  Bibliotecas:
+    - ESP32Servo (instalar pelo Gerenciador de Bibliotecas)
+    - WiFi.h e WebServer.h (incluidas no pacote ESP32 da Arduino IDE)
+
+  Rede Wi-Fi criada pelo ESP32:
+    SSID: Janelas-ESP32
+    Senha: janela123
+    Endereco: http://192.168.4.1
+
+  LOGICA DOS SENSORES:
+    - Infravermelho: LOW = obstaculo; HIGH = livre.
+    - Umidade:       LOW = umidade detectada; HIGH = sem umidade.
+
+  IMPORTANTE:
+    - Alimente os servos por uma fonte externa regulada de 5 V.
+    - Una o GND da fonte externa ao GND do ESP32.
+    - Nao alimente os tres servos pelo pino 5V/3V3 do ESP32.
+    - Alimente os modulos LM393 com 3,3 V (ou use adaptacao de nivel
+      se a saida do modulo estiver em 5 V). Os GPIOs do ESP32 NAO
+      toleram 5 V.
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+// ============================================================
+// 1. CONFIGURACAO FACIL - ALTERE OS PINOS NESTA SECAO
+// ============================================================
+
+// Pinos dos tres servos SG90
+const int PIN_SERVO[3] = {18, 19, 21};
+
+// Pinos dos tres sensores infravermelhos (um por janela)
+const int PIN_IR[3] = {25, 26, 27};
+
+// Sensor digital de umidade
+const int PIN_UMIDADE = 32;
+
+// Buzzer ativo
+const int PIN_BUZZER = 33;
+
+// Se o seu modulo de buzzer ligar com LOW, altere para false.
+const bool BUZZER_ACTIVE_HIGH = true;
+
+// Posicoes individuais dos servos.
+// 0 graus = janela aberta; 180 graus = janela fechada.
+// Ajuste cada janela separadamente conforme a montagem mecanica.
+int ANGULO_ABERTO[3]  = {10, 170, 170};
+int ANGULO_FECHADO[3] = {170, 10, 10};
+
+// Posicao inicial ao ligar o ESP32.
+// false = iniciar com as tres janelas abertas.
+// true  = iniciar com as tres janelas fechadas.
+const bool INICIAR_FECHADAS = false;
+
+// Velocidade: intervalo entre cada grau de movimento.
+// Aumente para movimento mais lento; diminua para mais rapido.
+const unsigned long INTERVALO_PASSO_SERVO_MS = 15;
+
+// Tempo de verificacao antes de iniciar um fechamento.
+const unsigned long TEMPO_VERIFICACAO_MS = 100;
+
+// O sensor infravermelho so confirma obstaculo apos LOW continuo por este tempo.
+const unsigned long FILTRO_SENSOR_IR_MS = 50;
+
+// Tempo entre tentativas automaticas apos obstaculo.
+const unsigned long TEMPO_RETENTATIVA_MS = 5000;
+// ============================================================
+// 2. CONFIGURACAO DO WI-FI
+// ============================================================
+
+const char* WIFI_SSID = "automação de Janelas";
+const char* WIFI_SENHA = "janela123"; // minimo de 8 caracteres
+
+WebServer server(80);
+Servo servos[3];
+
+// ============================================================
+// 3. VARIAVEIS INTERNAS
+// ============================================================
+
+enum EstadoMovimento {
+  PARADA,
+  VERIFICANDO_FECHAMENTO,
+  MOVENDO
+};
+
+struct Janela {
+  int anguloAtual;
+  int anguloAlvo;
+  bool alvoFechado;
+  EstadoMovimento estado;
+  unsigned long inicioVerificacao;
+  unsigned long ultimoPasso;
+  bool novaTentativaPendente;
+  unsigned long horarioNovaTentativa;
+};
+
+Janela janelas[3];
+
+bool modoAutomatico = false;
+bool umidadeAtiva = false;
+bool chuvaEmAndamento = false;
+bool estadoAnteriorSalvo[3] = {false, false, false};
+bool buzzerLigado = false;
+int apitosPendentes = 0;
+unsigned long horarioBuzzer = 0;
+bool aguardandoIntervaloBuzzer = false;
+
+// Estados filtrados dos tres sensores infravermelhos.
+// O LOW precisa permanecer continuo por FILTRO_SENSOR_IR_MS.
+bool irObstaculoConfirmado[3] = {false, false, false};
+bool irUltimaLeitura[3] = {HIGH, HIGH, HIGH};
+unsigned long irInicioContagem[3] = {0, 0, 0};
+
+// ============================================================
+// 4. INTERFACE WEB
+// ============================================================
+
+const char PAGINA_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Controle das Janelas</title>
+<style>
+:root{font-family:Arial,sans-serif;color:#eaf0f8;background:#101722}
+*{box-sizing:border-box}
+body{margin:0;padding:18px;max-width:850px;margin:auto}
+h1{font-size:25px;margin:8px 0}
+.sub{color:#9eafc3;margin:0 0 20px}
+.card{background:#1b2736;border:1px solid #304157;border-radius:14px;padding:16px;margin:13px 0}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.status{font-size:13px;color:#b9c8d8}
+.pill{padding:6px 10px;border-radius:20px;background:#34465c;font-size:12px}
+.good{background:#174b37;color:#9df0c3}
+.warn{background:#65451c;color:#ffe0a0}
+.bad{background:#652c35;color:#ffc0c7}
+button{border:0;border-radius:10px;padding:12px 16px;font-weight:bold;font-size:14px;cursor:pointer}
+.open{background:#2878c8;color:white}
+.close{background:#267b55;color:white}
+.mode{background:#6650b5;color:white}
+button:disabled{opacity:.4;cursor:not-allowed}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.window{background:#202f41;border-radius:12px;padding:14px}
+.window h3{margin:0 0 12px}
+.actions{display:flex;gap:8px}
+.actions button{flex:1}
+.line{display:flex;justify-content:space-between;margin:9px 0;color:#c3d0df;font-size:14px}
+.small{font-size:12px;color:#9eafc3}
+#alerta{color:#ffd27e;min-height:18px;font-size:13px}
+</style>
+</head>
+<body>
+<h1>Controle das janelas</h1>
+<p class="sub">Sistema de automacao ESP32</p>
+
+<div class="card">
+  <div class="row">
+    <div><b>Modo de funcionamento</b><div class="small" id="modoTexto">Carregando...</div></div>
+    <button class="mode" id="btnModo" onclick="alternarModo()">Ativar automatico</button>
+  </div>
+  <div id="alerta"></div>
+</div>
+
+<div class="card">
+  <b>Monitoramento geral</b>
+  <div class="line"><span>Sensor de umidade</span><span id="umidade" class="pill">---</span></div>
+  <div class="line"><span>Condicao de chuva/umidade</span><span id="chuva" class="pill">---</span></div>
+  <div class="line"><span>Buzzer</span><span id="buzzer" class="pill">---</span></div>
+  <div class="line"><span>Wi-Fi</span><span class="pill good">Conectado ao ESP32</span></div>
+</div>
+
+<h2>Controle individual</h2>
+<div class="grid">
+  <div class="window">
+    <h3>Janela 1</h3>
+    <div class="line"><span>Estado</span><b id="estado0">---</b></div>
+    <div class="line"><span>Sensor infravermelho</span><span id="ir0" class="pill">---</span></div>
+    <div class="line"><span>Posicao do servo</span><b id="angulo0">---</b></div>
+    <div class="actions">
+      <button class="open" onclick="comandar(0,'open')">Abrir</button>
+      <button class="close" onclick="comandar(0,'close')">Fechar</button>
+    </div>
+  </div>
+  <div class="window">
+    <h3>Janela 2</h3>
+    <div class="line"><span>Estado</span><b id="estado1">---</b></div>
+    <div class="line"><span>Sensor infravermelho</span><span id="ir1" class="pill">---</span></div>
+    <div class="line"><span>Posicao do servo</span><b id="angulo1">---</b></div>
+    <div class="actions">
+      <button class="open" onclick="comandar(1,'open')">Abrir</button>
+      <button class="close" onclick="comandar(1,'close')">Fechar</button>
+    </div>
+  </div>
+  <div class="window">
+    <h3>Janela 3</h3>
+    <div class="line"><span>Estado</span><b id="estado2">---</b></div>
+    <div class="line"><span>Sensor infravermelho</span><span id="ir2" class="pill">---</span></div>
+    <div class="line"><span>Posicao do servo</span><b id="angulo2">---</b></div>
+    <div class="actions">
+      <button class="open" onclick="comandar(2,'open')">Abrir</button>
+      <button class="close" onclick="comandar(2,'close')">Fechar</button>
+    </div>
+  </div>
+</div>
+
+<p class="small">A atualizacao dos estados ocorre automaticamente.</p>
+
+<script>
+async function atualizar(){
+  try{
+    const r=await fetch('/api/status');
+    const d=await r.json();
+    document.getElementById('modoTexto').textContent=d.automatico?'Automatico':'Manual';
+    document.getElementById('btnModo').textContent=d.automatico?'Desativar automatico':'Ativar automatico';
+    document.getElementById('umidade').textContent=d.umidade?'UMIDADE DETECTADA (LOW)':'SEM UMIDADE (HIGH)';
+    document.getElementById('umidade').className='pill '+(d.umidade?'warn':'good');
+    document.getElementById('chuva').textContent=d.chuva?'Fechamento automatico ativo':'Inativo';
+    document.getElementById('chuva').className='pill '+(d.chuva?'warn':'good');
+    document.getElementById('buzzer').textContent=d.buzzer?'Apitando':'Desligado';
+    document.getElementById('buzzer').className='pill '+(d.buzzer?'warn':'good');
+    document.getElementById('alerta').textContent=d.chuva?'Umidade detectada: o sistema esta tentando fechar as janelas.':'';
+    for(let i=0;i<3;i++){
+      const w=d.janelas[i];
+      document.getElementById('estado'+i).textContent=w.estado;
+      document.getElementById('angulo'+i).textContent=w.angulo+' graus';
+      document.getElementById('ir'+i).textContent=w.obstaculo?'OBSTACULO (LOW)':'LIVRE (HIGH)';
+      document.getElementById('ir'+i).className='pill '+(w.obstaculo?'bad':'good');
+    }
+    document.querySelectorAll('.actions button').forEach(b=>b.disabled=d.chuva);
+  }catch(e){}
+}
+async function comandar(i,acao){
+  try{
+    const r=await fetch('/api/window?i='+i+'&action='+acao);
+    if(!r.ok){const d=await r.json();alert(d.erro||'Comando nao aceito');}
+    atualizar();
+  }catch(e){alert('Falha de comunicacao com o ESP32');}
+}
+async function alternarModo(){
+  try{
+    const d=await (await fetch('/api/status')).json();
+    const r=await fetch('/api/mode?enabled='+(d.automatico?0:1));
+    if(!r.ok) alert('Nao foi possivel alterar o modo');
+    atualizar();
+  }catch(e){alert('Falha de comunicacao com o ESP32');}
+}
+atualizar();
+setInterval(atualizar,500);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================
+// 5. FUNCOES AUXILIARES
+// ============================================================
+
+void buzzerOff() {
+  digitalWrite(PIN_BUZZER, BUZZER_ACTIVE_HIGH ? LOW : HIGH);
+  buzzerLigado = false;
+}
+
+void buzzerOn() {
+  digitalWrite(PIN_BUZZER, BUZZER_ACTIVE_HIGH ? HIGH : LOW);
+  buzzerLigado = true;
+}
+
+void solicitarApitos(int quantidade = 2) {
+  apitosPendentes += quantidade;
+  if (apitosPendentes > 10) apitosPendentes = 10;
+}
+
+void atualizarBuzzer() {
+  unsigned long agora = millis();
+
+  if (buzzerLigado) {
+    if (agora - horarioBuzzer >= 120) {
+      buzzerOff();
+      horarioBuzzer = agora;
+      aguardandoIntervaloBuzzer = true;
+      apitosPendentes--;
+    }
+  } else if (aguardandoIntervaloBuzzer) {
+    if (agora - horarioBuzzer >= 140) {
+      aguardandoIntervaloBuzzer = false;
+    }
+  } else if (apitosPendentes > 0) {
+    buzzerOn();
+    horarioBuzzer = agora;
+  }
+}
+
+// Atualiza o filtro de 50 ms sem bloquear o ESP32.
+// Um pulso LOW menor que 50 ms e descartado.
+// HIGH libera a deteccao imediatamente.
+void atualizarSensoresIR() {
+  unsigned long agora = millis();
+
+  for (int i = 0; i < 3; i++) {
+    bool leituraAtual = digitalRead(PIN_IR[i]);
+
+    // Toda mudanca de nivel reinicia a contagem de estabilidade.
+    if (leituraAtual != irUltimaLeitura[i]) {
+      irUltimaLeitura[i] = leituraAtual;
+      irInicioContagem[i] = agora;
+    }
+
+    if (leituraAtual == HIGH) {
+      // Sensor livre: cancela qualquer deteccao anterior.
+      irObstaculoConfirmado[i] = false;
+    } else if (!irObstaculoConfirmado[i] &&
+               agora - irInicioContagem[i] >= FILTRO_SENSOR_IR_MS) {
+      // LOW estavel por 50 ms: obstaculo confirmado.
+      irObstaculoConfirmado[i] = true;
+    }
+  }
+}
+
+bool obstaculoDetectado(int indice) {
+  return irObstaculoConfirmado[indice];
+}
+
+bool umidadeDetectada() {
+  return digitalRead(PIN_UMIDADE) == LOW;
+}
+
+void iniciarAbertura(int indice) {
+  Janela &j = janelas[indice];
+  j.alvoFechado = false;
+  j.anguloAlvo = ANGULO_ABERTO[indice];
+  j.estado = MOVENDO;
+  j.novaTentativaPendente = false;
+  j.ultimoPasso = millis();
+}
+
+void iniciarVerificacaoFechamento(int indice) {
+  Janela &j = janelas[indice];
+  j.alvoFechado = true;
+  j.anguloAlvo = ANGULO_FECHADO[indice];
+  j.estado = VERIFICANDO_FECHAMENTO;
+  j.inicioVerificacao = millis();
+  j.novaTentativaPendente = false;
+}
+
+void tratarObstaculoNoFechamento(int indice) {
+  Janela &j = janelas[indice];
+
+  // Abre imediatamente para liberar o obstaculo.
+  j.alvoFechado = false;
+  j.anguloAlvo = ANGULO_ABERTO[indice];
+  j.estado = MOVENDO;
+  j.ultimoPasso = millis();
+
+  solicitarApitos(2);
+
+  // Somente no automatico existe nova tentativa apos 5 segundos.
+  if (chuvaEmAndamento) {
+    j.novaTentativaPendente = true;
+    j.horarioNovaTentativa = millis() + TEMPO_RETENTATIVA_MS;
+  } else {
+    j.novaTentativaPendente = false;
+  }
+}
+
+void fecharJanela(int indice) {
+  Janela &j = janelas[indice];
+
+  if (j.estado == PARADA &&
+      j.anguloAtual == ANGULO_FECHADO[indice] &&
+      j.alvoFechado) {
+    return;
+  }
+
+  iniciarVerificacaoFechamento(indice);
+}
+
+void abrirJanela(int indice) {
+  iniciarAbertura(indice);
+}
+
+void comandarJanela(int indice, bool fechar) {
+  if (indice < 0 || indice > 2) return;
+
+  if (fechar) fecharJanela(indice);
+  else abrirJanela(indice);
+}
+
+// ============================================================
+// 6. CONTROLE INDEPENDENTE DAS TRES JANELAS
+// ============================================================
+
+void atualizarJanela(int indice) {
+  Janela &j = janelas[indice];
+  unsigned long agora = millis();
+
+  // Durante o fechamento, qualquer LOW interrompe o movimento.
+  if (j.estado == MOVENDO && j.alvoFechado && obstaculoDetectado(indice)) {
+    tratarObstaculoNoFechamento(indice);
+    return;
+  }
+
+  // Verificacao inicial de 100 ms antes de fechar.
+  if (j.estado == VERIFICANDO_FECHAMENTO) {
+    if (obstaculoDetectado(indice)) {
+      tratarObstaculoNoFechamento(indice);
+      return;
+    }
+
+    if (agora - j.inicioVerificacao >= TEMPO_VERIFICACAO_MS) {
+      j.estado = MOVENDO;
+      j.ultimoPasso = agora;
+    }
+  }
+
+  // Movimento gradual, sem delay(), para nao bloquear os outros controles.
+  if (j.estado == MOVENDO) {
+    if (agora - j.ultimoPasso >= INTERVALO_PASSO_SERVO_MS) {
+      j.ultimoPasso = agora;
+
+      if (j.anguloAtual < j.anguloAlvo) {
+        j.anguloAtual++;
+        servos[indice].write(j.anguloAtual);
+      } else if (j.anguloAtual > j.anguloAlvo) {
+        j.anguloAtual--;
+        servos[indice].write(j.anguloAtual);
+      }
+
+      if (j.anguloAtual == j.anguloAlvo) {
+        j.estado = PARADA;
+      }
+    }
+  }
+
+  // Nova tentativa automatica somente depois de a janela terminar de abrir.
+  if (j.estado == PARADA && j.novaTentativaPendente && chuvaEmAndamento) {
+    if ((long)(agora - j.horarioNovaTentativa) >= 0) {
+      fecharJanela(indice);
+    }
+  }
+}
+
+// ============================================================
+// 7. MODO AUTOMATICO DO SENSOR DE UMIDADE
+// ============================================================
+
+void iniciarEventoDeUmidade() {
+  chuvaEmAndamento = true;
+
+  // Guarda o estado/objetivo de cada janela antes da chuva.
+  for (int i = 0; i < 3; i++) {
+    estadoAnteriorSalvo[i] = janelas[i].alvoFechado;
+  }
+
+  // Tenta fechar cada janela de forma independente.
+  for (int i = 0; i < 3; i++) {
+    if (!(janelas[i].estado == PARADA &&
+          janelas[i].anguloAtual == ANGULO_FECHADO[i])) {
+      fecharJanela(i);
+    }
+  }
+}
+
+void finalizarEventoDeUmidade() {
+  chuvaEmAndamento = false;
+
+  // Cancela tentativas pendentes e recupera os estados anteriores.
+  for (int i = 0; i < 3; i++) {
+    janelas[i].novaTentativaPendente = false;
+
+    if (estadoAnteriorSalvo[i]) {
+      fecharJanela(i);
+    } else {
+      abrirJanela(i);
+    }
+  }
+}
+
+void atualizarModoAutomatico() {
+  umidadeAtiva = umidadeDetectada();
+
+  bool condicaoDeChuva = modoAutomatico && umidadeAtiva;
+
+  if (condicaoDeChuva && !chuvaEmAndamento) {
+    iniciarEventoDeUmidade();
+  } else if (!condicaoDeChuva && chuvaEmAndamento) {
+    finalizarEventoDeUmidade();
+  }
+}
+
+// ============================================================
+// 8. API DA INTERFACE WEB
+// ============================================================
+
+void enviarStatus() {
+  String json = "{";
+  json += "\"automatico\":";
+  json += (modoAutomatico ? "true" : "false");
+  json += ",\"umidade\":";
+  json += (umidadeAtiva ? "true" : "false");
+  json += ",\"chuva\":";
+  json += (chuvaEmAndamento ? "true" : "false");
+  json += ",\"buzzer\":";
+  json += ((buzzerLigado || apitosPendentes > 0) ? "true" : "false");
+  json += ",\"janelas\":[";
+
+  for (int i = 0; i < 3; i++) {
+    if (i > 0) json += ",";
+
+    String estado;
+    if (janelas[i].estado == VERIFICANDO_FECHAMENTO) {
+      estado = "Verificando seguranca";
+    } else if (janelas[i].estado == MOVENDO) {
+      estado = janelas[i].alvoFechado ? "Fechando" : "Abrindo";
+    } else {
+      estado = janelas[i].alvoFechado ? "Fechada" : "Aberta";
+    }
+
+    json += "{";
+    json += "\"estado\":\"" + estado + "\",";
+    json += "\"angulo\":" + String(janelas[i].anguloAtual) + ",";
+    json += "\"obstaculo\":";
+    json += (obstaculoDetectado(i) ? "true" : "false");
+    json += "}";
+  }
+
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void tratarComandoJanela() {
+  if (!server.hasArg("i") || !server.hasArg("action")) {
+    server.send(400, "application/json", "{\"erro\":\"Parametros ausentes\"}");
+    return;
+  }
+
+  int indice = server.arg("i").toInt();
+  String acao = server.arg("action");
+
+  if (indice < 0 || indice > 2 || (acao != "open" && acao != "close")) {
+    server.send(400, "application/json", "{\"erro\":\"Comando invalido\"}");
+    return;
+  }
+
+  if (chuvaEmAndamento) {
+    server.send(409, "application/json",
+                "{\"erro\":\"Comandos manuais bloqueados enquanto a umidade estiver ativa\"}");
+    return;
+  }
+
+  comandarJanela(indice, acao == "close");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void tratarModo() {
+  if (!server.hasArg("enabled")) {
+    server.send(400, "application/json", "{\"erro\":\"Parametro ausente\"}");
+    return;
+  }
+
+  bool novoModo = (server.arg("enabled") == "1");
+
+  if (novoModo != modoAutomatico) {
+    modoAutomatico = novoModo;
+    // A avaliacao imediata trata tambem o caso de ligar o automatico
+    // quando o sensor ja esta detectando umidade.
+    atualizarModoAutomatico();
+  }
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ============================================================
+// 9. SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  // Entradas com pull-up: HIGH = livre/seco; LOW = detectado.
+  for (int i = 0; i < 3; i++) {
+    pinMode(PIN_IR[i], INPUT_PULLUP);
+    irUltimaLeitura[i] = digitalRead(PIN_IR[i]);
+    irInicioContagem[i] = millis();
+    irObstaculoConfirmado[i] = false;
+  }
+  pinMode(PIN_UMIDADE, INPUT_PULLUP);
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  buzzerOff();
+
+  // Inicializa cada servo na posicao inicial configurada.
+  for (int i = 0; i < 3; i++) {
+    servos[i].setPeriodHertz(50);
+    servos[i].attach(PIN_SERVO[i], 500, 2400);
+
+    int posicaoInicial = INICIAR_FECHADAS
+                         ? ANGULO_FECHADO[i]
+                         : ANGULO_ABERTO[i];
+
+    janelas[i].anguloAtual = posicaoInicial;
+    janelas[i].anguloAlvo = posicaoInicial;
+    janelas[i].alvoFechado = INICIAR_FECHADAS;
+    janelas[i].estado = PARADA;
+    janelas[i].inicioVerificacao = 0;
+    janelas[i].ultimoPasso = millis();
+    janelas[i].novaTentativaPendente = false;
+    janelas[i].horarioNovaTentativa = 0;
+
+    servos[i].write(posicaoInicial);
+  }
+
+  // Por padrao, o sistema inicia em modo manual.
+  modoAutomatico = false;
+  umidadeAtiva = umidadeDetectada();
+  chuvaEmAndamento = false;
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_SSID, WIFI_SENHA);
+
+  Serial.println();
+  Serial.println("Sistema de janelas iniciado.");
+  Serial.print("Rede Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+  Serial.print("Acesse: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html; charset=utf-8", PAGINA_HTML);
+  });
+
+  server.on("/api/status", HTTP_GET, enviarStatus);
+  server.on("/api/window", HTTP_GET, tratarComandoJanela);
+  server.on("/api/mode", HTTP_GET, tratarModo);
+
+  server.begin();
+}
+
+// ============================================================
+// 10. LOOP PRINCIPAL
+// ============================================================
+
+void loop() {
+  server.handleClient();
+
+  // Filtra os tres sensores antes de qualquer decisao de seguranca.
+  atualizarSensoresIR();
+
+  atualizarModoAutomatico();
+
+  // Cada janela e atualizada separadamente.
+  for (int i = 0; i < 3; i++) {
+    atualizarJanela(i);
+  }
+
+  atualizarBuzzer();
+
+  delay(1); // pequena pausa para o ESP32 processar tarefas do Wi-Fi
+}
